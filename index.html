@@ -135,6 +135,62 @@
             </article>
           </section>
 
+          <section class="mt-8 rounded-3xl border border-white/10 bg-white/5 p-6 shadow-soft backdrop-blur">
+            <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">Sprint 8 comparison</p>
+                <h3 class="mt-2 text-xl font-semibold text-white">Baseline vs Updated</h3>
+                <p class="mt-2 text-sm text-slate-400">
+                  Same date slicer and Activity Code filter drive both versions so the delta stays tied to the live dashboard state.
+                </p>
+              </div>
+              <div class="rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-sm text-slate-300">
+                <strong class="text-white">{{ baselineComparison.task_changes.added.length }}</strong> added
+                · <strong class="text-white">{{ baselineComparison.task_changes.removed.length }}</strong> removed
+                · <strong class="text-white">{{ baselineComparison.task_changes.modified.length }}</strong> modified
+              </div>
+            </div>
+
+            <div class="mt-6 grid gap-4 xl:grid-cols-4">
+              <article v-for="card in comparisonCards" :key="card.label" class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                <div class="flex items-center justify-between gap-3">
+                  <h4 class="text-sm font-semibold uppercase tracking-[0.25em] text-slate-500">{{ card.label }}</h4>
+                  <span :class="comparisonTone(Number(card.delta.replace(/[^0-9.-]/g, '')))" class="rounded-full border px-3 py-1 text-xs font-semibold">
+                    Delta {{ card.delta }}
+                  </span>
+                </div>
+                <div class="mt-4 grid gap-3 text-sm">
+                  <div class="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                    <span class="text-slate-400">Original</span>
+                    <span class="font-semibold text-white">{{ card.original }}</span>
+                  </div>
+                  <div class="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                    <span class="text-slate-400">Updated</span>
+                    <span class="font-semibold text-white">{{ card.updated }}</span>
+                  </div>
+                </div>
+              </article>
+            </div>
+
+            <div class="mt-6 grid gap-4 lg:grid-cols-3">
+              <article class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">Added</p>
+                <p class="mt-3 text-2xl font-semibold text-white">{{ baselineComparison.task_changes.added.length }}</p>
+                <p class="mt-2 text-sm text-slate-400">{{ formatOffenders(baselineComparison.task_changes.added) }}</p>
+              </article>
+              <article class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">Removed</p>
+                <p class="mt-3 text-2xl font-semibold text-white">{{ baselineComparison.task_changes.removed.length }}</p>
+                <p class="mt-2 text-sm text-slate-400">{{ formatOffenders(baselineComparison.task_changes.removed) }}</p>
+              </article>
+              <article class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">Modified</p>
+                <p class="mt-3 text-2xl font-semibold text-white">{{ baselineComparison.task_changes.modified.length }}</p>
+                <p class="mt-2 text-sm text-slate-400">{{ formatOffenders(baselineComparison.task_changes.modified) }}</p>
+              </article>
+            </div>
+          </section>
+
           <section class="mt-8 grid gap-6 xl:grid-cols-[1.5fr_1fr]">
             <article class="rounded-3xl border border-white/10 bg-white/5 p-6 shadow-soft backdrop-blur">
               <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
@@ -301,6 +357,41 @@
             },
             rules: [],
           },
+          baselineComparison: {
+            source: '',
+            filters: {
+              date_window: 'all',
+              activity_code: 'all',
+            },
+            original: {
+              source: 'original_xer',
+              task_count: 0,
+              total_budget: 0,
+              planned_value: 0,
+              earned_value: 0,
+              spi: null,
+            },
+            updated: {
+              source: 'updated_xer',
+              task_count: 0,
+              total_budget: 0,
+              planned_value: 0,
+              earned_value: 0,
+              spi: null,
+            },
+            delta: {
+              task_count: 0,
+              total_budget: 0,
+              planned_value: 0,
+              earned_value: 0,
+              spi: 0,
+            },
+            task_changes: {
+              added: [],
+              removed: [],
+              modified: [],
+            },
+          },
           activityCodeOptions: [
             { label: 'All Activity Codes', value: 'all', count: 0 },
           ],
@@ -377,6 +468,37 @@
                 { label: 'No data', weight: 0, budget: 0 },
               ];
           return items.slice(0, 3);
+        },
+        comparisonCards() {
+          const original = this.baselineComparison.original || {};
+          const updated = this.baselineComparison.updated || {};
+          const delta = this.baselineComparison.delta || {};
+          return [
+            {
+              label: 'BAC',
+              original: this.currency(original.total_budget),
+              updated: this.currency(updated.total_budget),
+              delta: this.signedCurrency(delta.total_budget),
+            },
+            {
+              label: 'PV',
+              original: this.currency(original.planned_value),
+              updated: this.currency(updated.planned_value),
+              delta: this.signedCurrency(delta.planned_value),
+            },
+            {
+              label: 'EV',
+              original: this.currency(original.earned_value),
+              updated: this.currency(updated.earned_value),
+              delta: this.signedCurrency(delta.earned_value),
+            },
+            {
+              label: 'SPI',
+              original: this.ratio(original.spi),
+              updated: this.ratio(updated.spi),
+              delta: this.signedRatio(delta.spi),
+            },
+          ];
         }
       },
       methods: {
@@ -391,6 +513,20 @@
         ratio(value) {
           if (value == null || Number.isNaN(value)) return '—';
           return Number(value).toFixed(2);
+        },
+        signedCurrency(value) {
+          if (value == null || Number.isNaN(value)) return '—';
+          const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+          return `${sign}${this.currency(Math.abs(value))}`;
+        },
+        signedRatio(value) {
+          if (value == null || Number.isNaN(value)) return '—';
+          const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+          return `${sign}${Math.abs(Number(value)).toFixed(2)}`;
+        },
+        comparisonTone(value) {
+          if (value == null || Number.isNaN(value) || value === 0) return 'border-slate-500/30 bg-slate-900/60 text-slate-200';
+          return value > 0 ? 'border-emerald-400/30 bg-emerald-500/10 text-emerald-200' : 'border-rose-400/30 bg-rose-500/10 text-rose-200';
         },
         percent(value) {
           if (value == null || Number.isNaN(value)) return '0%';
@@ -569,11 +705,41 @@
             rules: payload.rules || [],
           };
         },
+        async loadBaselineCompare() {
+          const response = await fetch(`http://127.0.0.1:8000/api/baseline-compare?${this.buildQueryString()}`);
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            if (response.status === 400 && String(payload.detail || '').includes('Baseline comparison requires both original and updated XER files.')) {
+              this.baselineComparison = {
+                source: '',
+                filters: {
+                  date_window: this.selectedWindow || 'all',
+                  activity_code: this.selectedActivityCode || 'all',
+                },
+                original: { source: 'original_xer', task_count: 0, total_budget: 0, planned_value: 0, earned_value: 0, spi: null },
+                updated: { source: 'updated_xer', task_count: 0, total_budget: 0, planned_value: 0, earned_value: 0, spi: null },
+                delta: { task_count: 0, total_budget: 0, planned_value: 0, earned_value: 0, spi: 0 },
+                task_changes: { added: [], removed: [], modified: [] },
+              };
+              return;
+            }
+            throw new Error(payload.detail || `API returned ${response.status}`);
+          }
+          const payload = await response.json();
+          this.baselineComparison = {
+            source: payload.source || '',
+            filters: payload.filters || { date_window: 'all', activity_code: 'all' },
+            original: payload.original || this.baselineComparison.original,
+            updated: payload.updated || this.baselineComparison.updated,
+            delta: payload.delta || this.baselineComparison.delta,
+            task_changes: payload.task_changes || this.baselineComparison.task_changes,
+          };
+        },
         async loadDashboard() {
           this.status = 'loading';
           this.error = '';
           try {
-            await Promise.all([this.loadKpis(), this.loadSCurve(), this.loadScheduleHealth()]);
+            await Promise.all([this.loadKpis(), this.loadSCurve(), this.loadScheduleHealth(), this.loadBaselineCompare()]);
             this.status = 'ready';
             this.$nextTick(() => this.updateChart());
           } catch (err) {

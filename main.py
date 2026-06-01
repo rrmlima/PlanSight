@@ -596,6 +596,161 @@ def _get_selected_project_dataset() -> tuple[str, dict[str, Any]]:
     return source_label, selected
 
 
+def _normalize_comparison_value(value: Any) -> Any:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return int(numeric) if numeric.is_integer() else round(numeric, 4)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except Exception:
+        return text
+    return int(numeric) if numeric.is_integer() else round(numeric, 4)
+
+
+def _task_id_set(tasks: pd.DataFrame) -> set[Any]:
+    task_id_column = _first_matching_column(tasks, ["task_id", "task_code", "task_pk"])
+    if task_id_column is None or tasks.empty:
+        return set()
+    return { _normalize_comparison_value(value) for value in tasks[task_id_column].dropna().tolist() }
+
+
+def _task_signature(row: pd.Series) -> tuple[Any, ...]:
+    columns = [
+        ["task_name", "task_short_name", "name"],
+        ["wbs_id", "projwbs_id", "parent_wbs_id"],
+        ["target_cost", "at_completion_total_cost", "budget_at_completion", "total_cost"],
+        ["planned_value", "bcws"],
+        ["earned_value", "bcwp"],
+        ["total_float_days", "total_float_day_cnt", "total_float_hr_cnt", "total_float"],
+        ["constraint_type", "cstr_type", "primary_constraint_type"],
+        ["act_end_date", "actual_end_date", "completion_date"],
+    ]
+    normalized_row = {str(column).lower(): row[column] for column in row.index}
+    signature: list[Any] = []
+    for candidates in columns:
+        value = None
+        for candidate in candidates:
+            if candidate.lower() in normalized_row:
+                value = normalized_row[candidate.lower()]
+                break
+        signature.append(_normalize_comparison_value(value))
+    return tuple(signature)
+
+
+def _build_performance_snapshot(
+    tasks: pd.DataFrame,
+    taskactv: pd.DataFrame,
+    data_date: pd.Timestamp | None,
+    *,
+    date_window: str = "all",
+    activity_code: str = "all",
+    source_label: str,
+) -> dict[str, Any]:
+    filtered_tasks, _ = _filter_dashboard_frames(
+        tasks,
+        taskactv,
+        data_date,
+        date_window=date_window,
+        activity_code=activity_code,
+    )
+    metrics = _calculate_evm_kpis(filtered_tasks)
+    task_count = int(len(filtered_tasks.index))
+    task_ids = _task_id_set(filtered_tasks)
+    return {
+        "source": source_label,
+        "task_count": task_count,
+        **metrics,
+        "task_ids": sorted(task_ids, key=lambda value: (str(type(value)), str(value))),
+    }
+
+
+def _build_baseline_comparison(
+    original_tasks: pd.DataFrame,
+    original_taskactv: pd.DataFrame,
+    updated_tasks: pd.DataFrame,
+    updated_taskactv: pd.DataFrame,
+    original_data_date: pd.Timestamp | None,
+    updated_data_date: pd.Timestamp | None,
+    *,
+    date_window: str = "all",
+    activity_code: str = "all",
+) -> dict[str, Any]:
+    original_snapshot = _build_performance_snapshot(
+        original_tasks,
+        original_taskactv,
+        original_data_date,
+        date_window=date_window,
+        activity_code=activity_code,
+        source_label="original_xer",
+    )
+    updated_snapshot = _build_performance_snapshot(
+        updated_tasks,
+        updated_taskactv,
+        updated_data_date,
+        date_window=date_window,
+        activity_code=activity_code,
+        source_label="updated_xer",
+    )
+
+    original_ids = set(original_snapshot.pop("task_ids", []))
+    updated_ids = set(updated_snapshot.pop("task_ids", []))
+    original_task_id_column = _first_matching_column(original_tasks, ["task_id", "task_code", "task_pk"])
+    updated_task_id_column = _first_matching_column(updated_tasks, ["task_id", "task_code", "task_pk"])
+
+    original_rows = {}
+    if original_task_id_column is not None and not original_tasks.empty:
+        for _, row in original_tasks.iterrows():
+            task_id = _normalize_comparison_value(row[original_task_id_column])
+            original_rows[task_id] = _task_signature(row)
+
+    updated_rows = {}
+    if updated_task_id_column is not None and not updated_tasks.empty:
+        for _, row in updated_tasks.iterrows():
+            task_id = _normalize_comparison_value(row[updated_task_id_column])
+            updated_rows[task_id] = _task_signature(row)
+
+    added = sorted(updated_ids - original_ids, key=lambda value: (str(type(value)), str(value)))
+    removed = sorted(original_ids - updated_ids, key=lambda value: (str(type(value)), str(value)))
+    modified = sorted(
+        [task_id for task_id in (original_ids & updated_ids) if original_rows.get(task_id) != updated_rows.get(task_id)],
+        key=lambda value: (str(type(value)), str(value)),
+    )
+
+    def _delta_value(updated_value: Any, original_value: Any) -> Any:
+        if updated_value is None or original_value is None:
+            return None
+        return round(float(updated_value) - float(original_value), 4)
+
+    return {
+        "original": original_snapshot,
+        "updated": updated_snapshot,
+        "delta": {
+            "task_count": int(updated_snapshot["task_count"] - original_snapshot["task_count"]),
+            "total_budget": _delta_value(updated_snapshot["total_budget"], original_snapshot["total_budget"]),
+            "planned_value": _delta_value(updated_snapshot["planned_value"], original_snapshot["planned_value"]),
+            "earned_value": _delta_value(updated_snapshot["earned_value"], original_snapshot["earned_value"]),
+            "spi": _delta_value(updated_snapshot["spi"], original_snapshot["spi"]),
+        },
+        "task_changes": {
+            "added": added,
+            "removed": removed,
+            "modified": modified,
+        },
+    }
+
+
 def _build_remaining_cost_dataframe(tasks: pd.DataFrame, wbs: pd.DataFrame) -> pd.DataFrame:
     if tasks is None or tasks.empty:
         return pd.DataFrame(
@@ -902,6 +1057,46 @@ async def get_schedule_health(date_window: str = Query("all"), activity_code: st
     return {
         "source": source_label,
         **assessment,
+    }
+
+
+@app.get("/api/baseline-compare")
+async def get_baseline_compare(date_window: str = Query("all"), activity_code: str = Query("all")) -> dict[str, Any]:
+    project_data = app.state.project_data
+    if project_data is None:
+        raise HTTPException(status_code=400, detail="No project data uploaded yet.")
+
+    original = project_data.get("original")
+    updated = project_data.get("updated")
+    if original is None or updated is None:
+        raise HTTPException(status_code=400, detail="Baseline comparison requires both original and updated XER files.")
+
+    original_tables = original.get("tables", {})
+    updated_tables = updated.get("tables", {})
+    original_tasks = original_tables.get("TASK", pd.DataFrame())
+    original_taskactv = original_tables.get("TASKACTV", pd.DataFrame())
+    updated_tasks = updated_tables.get("TASK", pd.DataFrame())
+    updated_taskactv = updated_tables.get("TASKACTV", pd.DataFrame())
+    original_data_date = _resolve_data_date(original_tasks, original_taskactv)
+    updated_data_date = _resolve_data_date(updated_tasks, updated_taskactv)
+
+    comparison = _build_baseline_comparison(
+        original_tasks,
+        original_taskactv,
+        updated_tasks,
+        updated_taskactv,
+        original_data_date,
+        updated_data_date,
+        date_window=date_window,
+        activity_code=activity_code,
+    )
+    return {
+        "source": "updated_vs_original",
+        "filters": {
+            "date_window": date_window,
+            "activity_code": activity_code,
+        },
+        **comparison,
     }
 
 

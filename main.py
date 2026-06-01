@@ -53,6 +53,21 @@ def _first_matching_series(df: pd.DataFrame, candidates: list[str]) -> pd.Series
     return None
 
 
+def _sum_matching_series(df: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
+    normalized = {column.lower(): column for column in df.columns}
+    series_list: list[pd.Series] = []
+    for candidate in candidates:
+        if candidate.lower() in normalized:
+            column = normalized[candidate.lower()]
+            series_list.append(pd.to_numeric(df[column], errors="coerce").fillna(0))
+    if not series_list:
+        return None
+    total = series_list[0].copy()
+    for series in series_list[1:]:
+        total = total.add(series, fill_value=0)
+    return total.fillna(0)
+
+
 def _first_matching_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
     normalized = {column.lower(): column for column in df.columns}
     for candidate in candidates:
@@ -77,7 +92,9 @@ def _calculate_evm_kpis(tasks: pd.DataFrame) -> dict[str, float]:
             "total_budget": 0.0,
             "planned_value": 0.0,
             "earned_value": 0.0,
+            "actual_cost": 0.0,
             "spi": None,
+            "cpi": None,
         }
 
     budget_series = _first_matching_series(
@@ -102,11 +119,35 @@ def _calculate_evm_kpis(tasks: pd.DataFrame) -> dict[str, float]:
         else:
             earned_value_series = pd.Series([0.0] * len(tasks.index), dtype="float64")
 
+    actual_cost_series = _sum_matching_series(
+        tasks,
+        [
+            "actual_cost",
+            "act_cost",
+            "act_reg_cost",
+            "act_labor_cost",
+            "act_mat_cost",
+            "act_equip_cost",
+            "actual_expense",
+        ],
+    )
+    if actual_cost_series is None:
+        actual_cost_series = pd.Series([0.0] * len(tasks.index), dtype="float64")
+
+    total_budget = round(float(budget_series.sum()), 2)
+    planned_value = round(float(planned_value_series.sum()), 2)
+    earned_value = round(float(earned_value_series.sum()), 2)
+    actual_cost = round(float(actual_cost_series.sum()), 2)
+    spi = round(earned_value / planned_value, 4) if planned_value else None
+    cpi = round(earned_value / actual_cost, 4) if actual_cost else None
+
     return {
-        "total_budget": round(float(budget_series.sum()), 2),
-        "planned_value": round(float(planned_value_series.sum()), 2),
-        "earned_value": round(float(earned_value_series.sum()), 2),
-        "spi": round(float(earned_value_series.sum()) / float(planned_value_series.sum()), 4) if float(planned_value_series.sum()) else None,
+        "total_budget": total_budget,
+        "planned_value": planned_value,
+        "earned_value": earned_value,
+        "actual_cost": actual_cost,
+        "spi": spi,
+        "cpi": cpi,
     }
 
 

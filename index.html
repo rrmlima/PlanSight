@@ -457,6 +457,7 @@
             bac: 0,
             pv: 0,
             ev: 0,
+            ac: 0,
             spi: null,
             cpi: null,
             source: '',
@@ -594,6 +595,12 @@
               help: 'Physical progress converted into earned value when BCWP is absent.'
             },
             {
+              label: 'AC',
+              value: this.currency(this.kpis.ac),
+              badge: 'Actual Cost',
+              help: 'Summed from actual cost columns when present in the uploaded TASK data.'
+            },
+            {
               label: 'SPI',
               value: this.ratio(this.kpis.spi),
               badge: 'Schedule Performance',
@@ -603,7 +610,7 @@
               label: 'CPI',
               value: this.ratio(this.kpis.cpi),
               badge: 'Cost Performance',
-              help: 'Placeholder until actual cost (AC) is exposed by a later endpoint.'
+              help: 'Derived in the backend as EV / AC when actual cost is available.'
             }
           ];
         },
@@ -845,14 +852,17 @@
           const bac = Number(payload.total_budget || 0);
           const pv = Number(payload.planned_value || 0);
           const ev = Number(payload.earned_value || 0);
+          const ac = Number(payload.actual_cost || 0);
           const spi = payload.spi != null ? Number(payload.spi) : (pv > 0 ? ev / pv : null);
+          const cpi = payload.cpi != null ? Number(payload.cpi) : (ac > 0 ? ev / ac : null);
 
           this.kpis = {
             bac,
             pv,
             ev,
+            ac,
             spi,
-            cpi: null,
+            cpi,
             source: payload.source || 'api',
           };
         },

@@ -751,6 +751,174 @@ def _build_baseline_comparison(
     }
 
 
+def _build_critical_path_summary(
+    tasks: pd.DataFrame,
+    taskpred: pd.DataFrame,
+    taskactv: pd.DataFrame,
+    data_date: pd.Timestamp | None,
+    *,
+    date_window: str = "all",
+    activity_code: str = "all",
+    source_label: str,
+    threshold_days: float = 5.0,
+) -> dict[str, Any]:
+    filtered_tasks, _ = _filter_dashboard_frames(
+        tasks,
+        taskactv if taskactv is not None else pd.DataFrame(),
+        data_date,
+        date_window=date_window,
+        activity_code=activity_code,
+    )
+
+    if filtered_tasks is None or filtered_tasks.empty:
+        return {
+            "source": source_label,
+            "summary": {
+                "total_tasks": 0,
+                "critical_path_duration_days": 0.0,
+                "critical_path_task_count": 0,
+                "near_critical_task_count": 0,
+                "threshold_days": threshold_days,
+            },
+            "critical_path_task_ids": [],
+            "critical_path_task_names": [],
+            "critical_path_tasks": [],
+            "near_critical_task_ids": [],
+            "near_critical_task_names": [],
+            "near_critical_tasks": [],
+        }
+
+    task_id_column = _first_matching_column(filtered_tasks, ["task_id", "task_code", "task_pk"])
+    task_name_column = _first_matching_column(filtered_tasks, ["task_name", "task_short_name", "name"])
+    duration_series = _first_matching_series(
+        filtered_tasks,
+        ["target_duration", "remaining_duration", "duration", "orig_duration"],
+    )
+    if duration_series is None:
+        duration_series = pd.Series([1.0] * len(filtered_tasks.index), index=filtered_tasks.index, dtype="float64")
+    else:
+        duration_series = duration_series.astype("float64").fillna(1.0)
+
+    float_series = _first_matching_series(
+        filtered_tasks,
+        ["total_float_days", "total_float_day_cnt", "total_float_hr_cnt", "total_float"],
+    )
+    if float_series is not None:
+        float_series = float_series.astype("float64")
+
+    node_order: dict[Any, int] = {}
+    node_data: dict[Any, dict[str, Any]] = {}
+    for position, (index, row) in enumerate(filtered_tasks.iterrows()):
+        task_id_value = _normalize_comparison_value(row[task_id_column]) if task_id_column is not None else _normalize_comparison_value(index)
+        if task_id_value is None:
+            task_id_value = index
+        task_name = str(row[task_name_column]) if task_name_column is not None and pd.notna(row[task_name_column]) else f"Task {task_id_value}"
+        duration_days = round(float(duration_series.loc[index]), 2)
+        float_days = None
+        if float_series is not None and index in float_series.index and pd.notna(float_series.loc[index]):
+            float_days = round(float(float_series.loc[index]), 2)
+        node_order[task_id_value] = position
+        node_data[task_id_value] = {
+            "task_id": task_id_value,
+            "task_name": task_name,
+            "duration_days": duration_days,
+            "total_float_days": float_days,
+        }
+
+    if not node_data:
+        return {
+            "source": source_label,
+            "summary": {
+                "total_tasks": 0,
+                "critical_path_duration_days": 0.0,
+                "critical_path_task_count": 0,
+                "near_critical_task_count": 0,
+                "threshold_days": threshold_days,
+            },
+            "critical_path_task_ids": [],
+            "critical_path_task_names": [],
+            "critical_path_tasks": [],
+            "near_critical_task_ids": [],
+            "near_critical_task_names": [],
+            "near_critical_tasks": [],
+        }
+
+    predecessors: dict[Any, set[Any]] = {task_id: set() for task_id in node_data}
+    successors: dict[Any, set[Any]] = {task_id: set() for task_id in node_data}
+
+    if taskpred is not None and not taskpred.empty:
+        pred_task_column = _first_matching_column(taskpred, ["task_id", "task_code", "task_pk"])
+        pred_pred_column = _first_matching_column(taskpred, ["pred_task_id", "pred_task_code", "pred_task_pk"])
+        if pred_task_column is not None and pred_pred_column is not None:
+            for _, row in taskpred.iterrows():
+                successor_id = _normalize_comparison_value(row[pred_task_column])
+                predecessor_id = _normalize_comparison_value(row[pred_pred_column])
+                if successor_id in node_data and predecessor_id in node_data:
+                    predecessors[successor_id].add(predecessor_id)
+                    successors[predecessor_id].add(successor_id)
+
+    indegree = {task_id: len(preds) for task_id, preds in predecessors.items()}
+    queue = sorted([task_id for task_id, degree in indegree.items() if degree == 0], key=lambda task_id: node_order[task_id])
+    topo_order: list[Any] = []
+    queue_index = 0
+    while queue_index < len(queue):
+        task_id = queue[queue_index]
+        queue_index += 1
+        topo_order.append(task_id)
+        for successor_id in sorted(successors[task_id], key=lambda node: node_order[node]):
+            indegree[successor_id] -= 1
+            if indegree[successor_id] == 0:
+                queue.append(successor_id)
+    if len(topo_order) < len(node_data):
+        remaining = [task_id for task_id in node_data if task_id not in topo_order]
+        topo_order.extend(sorted(remaining, key=lambda task_id: node_order[task_id]))
+
+    best_duration = {task_id: node_data[task_id]["duration_days"] for task_id in node_data}
+    best_previous = {task_id: None for task_id in node_data}
+    for task_id in topo_order:
+        for successor_id in successors.get(task_id, set()):
+            candidate_duration = best_duration[task_id] + node_data[successor_id]["duration_days"]
+            if candidate_duration > best_duration[successor_id]:
+                best_duration[successor_id] = candidate_duration
+                best_previous[successor_id] = task_id
+
+    end_task_id = max(node_data, key=lambda task_id: (best_duration[task_id], -node_order[task_id]))
+    critical_path: list[Any] = []
+    cursor: Any | None = end_task_id
+    while cursor is not None:
+        critical_path.append(cursor)
+        cursor = best_previous[cursor]
+    critical_path.reverse()
+
+    critical_set = set(critical_path)
+    near_critical = [
+        task_id
+        for task_id, info in node_data.items()
+        if task_id not in critical_set and info["total_float_days"] is not None and info["total_float_days"] <= threshold_days
+    ]
+    near_critical.sort(key=lambda task_id: (node_data[task_id]["total_float_days"], node_order[task_id]))
+
+    def _path_detail(task_id: Any) -> dict[str, Any]:
+        return node_data[task_id]
+
+    return {
+        "source": source_label,
+        "summary": {
+            "total_tasks": int(len(node_data)),
+            "critical_path_duration_days": round(float(best_duration[end_task_id]), 2),
+            "critical_path_task_count": int(len(critical_path)),
+            "near_critical_task_count": int(len(near_critical)),
+            "threshold_days": threshold_days,
+        },
+        "critical_path_task_ids": critical_path,
+        "critical_path_task_names": [node_data[task_id]["task_name"] for task_id in critical_path],
+        "critical_path_tasks": [_path_detail(task_id) for task_id in critical_path],
+        "near_critical_task_ids": near_critical,
+        "near_critical_task_names": [node_data[task_id]["task_name"] for task_id in near_critical],
+        "near_critical_tasks": [_path_detail(task_id) for task_id in near_critical],
+    }
+
+
 def _build_remaining_cost_dataframe(tasks: pd.DataFrame, wbs: pd.DataFrame) -> pd.DataFrame:
     if tasks is None or tasks.empty:
         return pd.DataFrame(
@@ -1057,6 +1225,44 @@ async def get_schedule_health(date_window: str = Query("all"), activity_code: st
     return {
         "source": source_label,
         **assessment,
+    }
+
+
+@app.get("/api/critical-path")
+async def get_critical_path(date_window: str = Query("all"), activity_code: str = Query("all")) -> dict[str, Any]:
+    source_label, selected = _get_selected_project_dataset()
+    tables = selected["tables"]
+    tasks = tables.get("TASK", pd.DataFrame())
+    taskpred = tables.get("TASKPRED", pd.DataFrame())
+    taskactv = tables.get("TASKACTV", pd.DataFrame())
+    data_date = _resolve_data_date(tasks, taskactv)
+    filtered_tasks, filtered_taskactv = _filter_dashboard_frames(tasks, taskactv, data_date, date_window=date_window, activity_code=activity_code)
+    filtered_taskpred = taskpred
+    if not filtered_tasks.empty and not taskpred.empty:
+        task_id_column = _first_matching_column(filtered_tasks, ["task_id", "task_code", "task_pk"])
+        pred_task_column = _first_matching_column(taskpred, ["task_id", "task_code", "task_pk"])
+        pred_pred_column = _first_matching_column(taskpred, ["pred_task_id", "pred_task_code", "pred_task_pk"])
+        if task_id_column is not None and pred_task_column is not None and pred_pred_column is not None:
+            filtered_task_ids = set(filtered_tasks[task_id_column].dropna().tolist())
+            filtered_taskpred = taskpred[
+                taskpred[pred_task_column].isin(filtered_task_ids) | taskpred[pred_pred_column].isin(filtered_task_ids)
+            ].copy()
+    critical_path = _build_critical_path_summary(
+        filtered_tasks,
+        filtered_taskpred,
+        taskactv,
+        data_date,
+        date_window=date_window,
+        activity_code=activity_code,
+        source_label=source_label,
+    )
+    return {
+        "source": source_label,
+        "filters": {
+            "date_window": date_window,
+            "activity_code": activity_code,
+        },
+        **critical_path,
     }
 
 

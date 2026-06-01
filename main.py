@@ -1,0 +1,911 @@
+from __future__ import annotations
+
+from io import BytesIO
+from typing import Any
+
+import pandas as pd
+import xlsxwriter
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from src.xer_parser import XERParser
+
+
+app = FastAPI(title="PlanSight Local API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.state.project_data = None
+
+
+EXCEL_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _parse_uploaded_xer(upload: UploadFile) -> dict[str, pd.DataFrame]:
+    parser = XERParser(file_path=upload.filename or "<memory>")
+    content = upload.file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail=f"Uploaded file is empty: {upload.filename}")
+    return parser.parse_bytes(content)
+
+
+def _table_snapshot(tables: dict[str, pd.DataFrame]) -> dict[str, Any]:
+    tasks = tables.get("TASK", pd.DataFrame())
+    return {
+        "tables": sorted(tables.keys()),
+        "task_count": int(len(tasks.index)),
+    }
+
+
+def _first_matching_series(df: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
+    normalized = {column.lower(): column for column in df.columns}
+    for candidate in candidates:
+        if candidate.lower() in normalized:
+            column = normalized[candidate.lower()]
+            return pd.to_numeric(df[column], errors="coerce").fillna(0)
+    return None
+
+
+def _first_matching_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    normalized = {column.lower(): column for column in df.columns}
+    for candidate in candidates:
+        if candidate.lower() in normalized:
+            return normalized[candidate.lower()]
+    return None
+
+
+def _first_matching_datetime_series(df: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
+    column = _first_matching_column(df, candidates)
+    if column is None:
+        return None
+    parsed = pd.to_datetime(df[column], errors="coerce")
+    if parsed.notna().any():
+        return parsed
+    return None
+
+
+def _calculate_evm_kpis(tasks: pd.DataFrame) -> dict[str, float]:
+    if tasks.empty:
+        return {
+            "total_budget": 0.0,
+            "planned_value": 0.0,
+            "earned_value": 0.0,
+            "spi": None,
+        }
+
+    budget_series = _first_matching_series(
+        tasks,
+        ["target_cost", "at_completion_total_cost", "budget_at_completion", "total_cost"],
+    )
+    if budget_series is None:
+        budget_series = pd.Series([0.0] * len(tasks.index), dtype="float64")
+
+    planned_value_series = _first_matching_series(tasks, ["planned_value", "bcws"])
+    if planned_value_series is None:
+        planned_value_series = pd.Series([0.0] * len(tasks.index), dtype="float64")
+
+    earned_value_series = _first_matching_series(tasks, ["earned_value", "bcwp"])
+    if earned_value_series is None:
+        progress_series = _first_matching_series(
+            tasks,
+            ["phys_complete_pct", "task_complete_pct", "complete_pct", "percent_complete"],
+        )
+        if progress_series is not None:
+            earned_value_series = budget_series * (progress_series / 100.0)
+        else:
+            earned_value_series = pd.Series([0.0] * len(tasks.index), dtype="float64")
+
+    return {
+        "total_budget": round(float(budget_series.sum()), 2),
+        "planned_value": round(float(planned_value_series.sum()), 2),
+        "earned_value": round(float(earned_value_series.sum()), 2),
+        "spi": round(float(earned_value_series.sum()) / float(planned_value_series.sum()), 4) if float(planned_value_series.sum()) else None,
+    }
+
+
+def _resolve_data_date(tasks: pd.DataFrame, taskactv: pd.DataFrame) -> pd.Timestamp | None:
+    for frame in [taskactv, tasks]:
+        if frame is None or frame.empty:
+            continue
+        for candidates in [
+            ["data_date", "last_recalc_date", "status_date", "update_date"],
+            ["act_end_date", "actual_end_date", "completion_date"],
+            ["target_end_date", "planned_end_date", "end_date"],
+        ]:
+            series = _first_matching_datetime_series(frame, candidates)
+            if series is not None:
+                valid = series.dropna()
+                if not valid.empty:
+                    return valid.max().normalize()
+    return None
+
+
+def _normalize_dashboard_filter_value(value: str | None) -> str:
+    if value is None:
+        return "all"
+    normalized = str(value).strip()
+    return normalized.lower() if normalized else "all"
+
+
+def _normalize_text_value(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _preferred_activity_code_column(df: pd.DataFrame) -> str | None:
+    preferred = [
+        "activity_code",
+        "activity_code_value",
+        "actv_code_name",
+        "code_value",
+        "code_name",
+        "code",
+        "actv_code",
+        "actv_code_id",
+    ]
+    column = _first_matching_column(df, preferred)
+    if column is not None:
+        return column
+
+    ignore_tokens = ("task", "pred", "succ", "wbs", "date", "cost", "value", "float", "pct", "percent", "budget", "earned", "planned", "actual", "start", "end", "resource")
+    for candidate in df.columns:
+        lower = candidate.lower()
+        if any(token in lower for token in ignore_tokens):
+            continue
+        non_null = df[candidate].dropna()
+        if non_null.empty:
+            continue
+        if non_null.astype(str).map(lambda value: len(value.strip()) > 0).any():
+            return candidate
+    return None
+
+
+def _build_activity_code_catalog(taskactv: pd.DataFrame, actvcode: pd.DataFrame | None = None) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = [{"value": "all", "label": "All Activity Codes", "count": 0}]
+    frames = [frame for frame in [taskactv, actvcode] if frame is not None and not frame.empty]
+    if not frames:
+        return options
+
+    counts: dict[str, int] = {}
+    labels: dict[str, str] = {}
+
+    for frame in frames:
+        code_column = _preferred_activity_code_column(frame)
+        if code_column is None:
+            continue
+
+        task_id_column = _first_matching_column(frame, ["task_id", "task_code", "task_pk"])
+        if task_id_column is not None:
+            grouped = (
+                frame[[task_id_column, code_column]]
+                .dropna(subset=[code_column])
+                .assign(code=lambda data: data[code_column].map(_normalize_text_value))
+            )
+            grouped = grouped[grouped["code"] != ""]
+            for code_value, group in grouped.groupby("code"):
+                counts[code_value] = counts.get(code_value, 0) + int(group[task_id_column].nunique())
+                labels.setdefault(code_value, code_value)
+        else:
+            series = frame[code_column].dropna().map(_normalize_text_value)
+            for code_value, count in series.value_counts().items():
+                if not code_value:
+                    continue
+                counts[code_value] = counts.get(code_value, 0) + int(count)
+                labels.setdefault(code_value, code_value)
+
+    for code_value, count in sorted(counts.items(), key=lambda item: (-item[1], item[0].lower())):
+        options.append({"value": code_value, "label": labels.get(code_value, code_value), "count": int(count)})
+
+    if len(options) == 1:
+        return [{"value": "all", "label": "All Activity Codes", "count": 0}]
+
+    options[0]["count"] = int(sum(item["count"] for item in options[1:]))
+    return options
+
+
+def _build_dashboard_date_mask(tasks: pd.DataFrame, data_date: pd.Timestamp, date_window: str) -> pd.Series:
+    normalized_window = _normalize_dashboard_filter_value(date_window)
+    if normalized_window == "all" or data_date is None or tasks.empty:
+        return pd.Series([True] * len(tasks.index), index=tasks.index)
+
+    months_by_window = {"3m": 3, "6m": 6}
+    months = months_by_window.get(normalized_window)
+    if months is None:
+        return pd.Series([True] * len(tasks.index), index=tasks.index)
+
+    cutoff = (data_date - pd.DateOffset(months=months)).normalize()
+    mask = pd.Series([False] * len(tasks.index), index=tasks.index)
+    found_series = False
+    for candidates in [
+        ["act_end_date", "actual_end_date", "completion_date"],
+        ["target_end_date", "planned_end_date", "end_date"],
+        ["last_recalc_date", "data_date", "status_date", "update_date"],
+    ]:
+        series = _first_matching_datetime_series(tasks, candidates)
+        if series is not None:
+            found_series = True
+            mask = mask | series.between(cutoff, data_date, inclusive="both")
+    if not found_series:
+        return pd.Series([True] * len(tasks.index), index=tasks.index)
+    return mask
+
+
+def _filter_dashboard_frames(
+    tasks: pd.DataFrame,
+    taskactv: pd.DataFrame,
+    data_date: pd.Timestamp | None,
+    date_window: str = "all",
+    activity_code: str = "all",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    filtered_tasks = tasks.copy()
+    normalized_window = _normalize_dashboard_filter_value(date_window)
+    normalized_code = _normalize_text_value(activity_code).lower()
+
+    if data_date is not None and normalized_window != "all":
+        mask = _build_dashboard_date_mask(filtered_tasks, data_date, normalized_window)
+        filtered_tasks = filtered_tasks.loc[mask].copy()
+
+    if normalized_code and normalized_code != "all" and taskactv is not None and not taskactv.empty:
+        task_id_column = _first_matching_column(filtered_tasks, ["task_id", "task_code", "task_pk"])
+        taskactv_task_id_column = _first_matching_column(taskactv, ["task_id", "task_code", "task_pk"])
+        code_column = _preferred_activity_code_column(taskactv)
+        if task_id_column is not None and taskactv_task_id_column is not None and code_column is not None:
+            matching_task_ids = (
+                taskactv[[taskactv_task_id_column, code_column]]
+                .dropna(subset=[code_column])
+                .assign(code=lambda data: data[code_column].map(lambda value: _normalize_text_value(value).lower()))
+            )
+            matching_task_ids = matching_task_ids[matching_task_ids["code"] == normalized_code][taskactv_task_id_column].tolist()
+            filtered_tasks = filtered_tasks[filtered_tasks[task_id_column].isin(matching_task_ids)].copy()
+
+    filtered_taskactv = pd.DataFrame()
+    if taskactv is not None and not taskactv.empty:
+        task_id_column = _first_matching_column(filtered_tasks, ["task_id", "task_code", "task_pk"])
+        taskactv_task_id_column = _first_matching_column(taskactv, ["task_id", "task_code", "task_pk"])
+        if task_id_column is not None and taskactv_task_id_column is not None:
+            filtered_taskactv = taskactv[taskactv[taskactv_task_id_column].isin(filtered_tasks[task_id_column])].copy()
+        else:
+            filtered_taskactv = taskactv.copy()
+
+    return filtered_tasks, filtered_taskactv
+
+
+def _build_event_curve(tasks: pd.DataFrame, taskactv: pd.DataFrame) -> dict[str, Any]:
+    source_df = tasks if tasks is not None and not tasks.empty else taskactv
+    if source_df is None or source_df.empty:
+        return {
+            "data_date": None,
+            "dates": [],
+            "planned_value": [],
+            "earned_value": [],
+        }
+
+    budget_series = _first_matching_series(
+        source_df,
+        ["target_cost", "planned_cost", "cost", "at_completion_total_cost", "budget_at_completion", "total_cost"],
+    )
+    if budget_series is None:
+        budget_series = pd.Series([0.0] * len(source_df.index), index=source_df.index, dtype="float64")
+    else:
+        budget_series = budget_series.astype("float64")
+
+    planned_value_series = _first_matching_series(source_df, ["planned_value", "bcws"])
+    if planned_value_series is None:
+        planned_value_series = budget_series.copy()
+    else:
+        planned_value_series = planned_value_series.astype("float64")
+
+    earned_value_series = _first_matching_series(source_df, ["earned_value", "bcwp"])
+    if earned_value_series is None:
+        progress_series = _first_matching_series(
+            source_df,
+            ["phys_complete_pct", "task_complete_pct", "complete_pct", "percent_complete"],
+        )
+        if progress_series is not None:
+            earned_value_series = budget_series * (progress_series / 100.0)
+        else:
+            earned_value_series = pd.Series([0.0] * len(source_df.index), index=source_df.index, dtype="float64")
+    else:
+        earned_value_series = earned_value_series.astype("float64")
+
+    planned_dates = _first_matching_datetime_series(
+        source_df,
+        ["target_end_date", "planned_end_date", "early_end_date", "late_end_date", "end_date"],
+    )
+    actual_dates = _first_matching_datetime_series(
+        source_df,
+        ["act_end_date", "actual_end_date", "completion_date", "status_date", "last_recalc_date"],
+    )
+    data_date = _resolve_data_date(tasks, taskactv)
+
+    planned_events: list[tuple[pd.Timestamp, float]] = []
+    earned_events: list[tuple[pd.Timestamp, float]] = []
+
+    for index in source_df.index:
+        planned_date = planned_dates.loc[index].normalize() if planned_dates is not None and pd.notna(planned_dates.loc[index]) else None
+        actual_date = actual_dates.loc[index].normalize() if actual_dates is not None and pd.notna(actual_dates.loc[index]) else None
+        planned_value = float(planned_value_series.loc[index])
+        earned_value = float(earned_value_series.loc[index])
+
+        if planned_date is not None:
+            planned_events.append((planned_date, planned_value))
+
+        if earned_value > 0:
+            earned_date = actual_date or data_date or planned_date
+            if earned_date is not None and data_date is not None and earned_date > data_date:
+                earned_date = data_date
+            if earned_date is not None:
+                earned_events.append((earned_date, earned_value))
+
+    unique_dates = sorted({date for date, _ in planned_events + earned_events} | ({data_date} if data_date is not None else set()))
+    if not unique_dates:
+        return {
+            "data_date": data_date.strftime("%Y-%m-%d") if data_date is not None else None,
+            "dates": [],
+            "planned_value": [],
+            "earned_value": [],
+        }
+
+    planned_by_date = pd.Series(0.0, index=unique_dates, dtype="float64")
+    earned_by_date = pd.Series(0.0, index=unique_dates, dtype="float64")
+
+    for event_date, value in planned_events:
+        planned_by_date.loc[event_date] += value
+
+    for event_date, value in earned_events:
+        earned_by_date.loc[event_date] += value
+
+    cumulative_pv = planned_by_date.cumsum().round(2)
+    cumulative_ev = earned_by_date.cumsum().round(2)
+
+    return {
+        "data_date": data_date.strftime("%Y-%m-%d") if data_date is not None else None,
+        "dates": [date.strftime("%Y-%m-%d") for date in unique_dates],
+        "planned_value": [round(float(value), 2) for value in cumulative_pv.tolist()],
+        "earned_value": [round(float(value), 2) for value in cumulative_ev.tolist()],
+    }
+
+
+def _calculate_wbs_weights(tasks: pd.DataFrame, wbs: pd.DataFrame) -> list[dict[str, Any]]:
+    if tasks.empty:
+        return []
+
+    budget_series = _first_matching_series(
+        tasks,
+        ["target_cost", "at_completion_total_cost", "budget_at_completion", "total_cost"],
+    )
+    wbs_column = _first_matching_column(tasks, ["wbs_id", "projwbs_id", "parent_wbs_id"])
+    if budget_series is None or wbs_column is None:
+        return []
+
+    grouped = (
+        pd.DataFrame({"wbs_id": tasks[wbs_column], "budget": budget_series.astype("float64")})
+        .dropna(subset=["wbs_id"])
+        .groupby("wbs_id", as_index=False)["budget"]
+        .sum()
+    )
+    if grouped.empty:
+        return []
+
+    total_budget = float(grouped["budget"].sum())
+    label_lookup: dict[Any, str] = {}
+    if wbs is not None and not wbs.empty:
+        id_column = _first_matching_column(wbs, ["wbs_id", "projwbs_id"])
+        label_column = _first_matching_column(wbs, ["wbs_name", "wbs_short_name", "wbs_code"])
+        if id_column is not None and label_column is not None:
+            label_lookup = {
+                row[id_column]: str(row[label_column])
+                for _, row in wbs[[id_column, label_column]].dropna(subset=[id_column]).iterrows()
+            }
+
+    grouped = grouped.sort_values("budget", ascending=False)
+    weights: list[dict[str, Any]] = []
+    for _, row in grouped.iterrows():
+        wbs_id = row["wbs_id"]
+        budget = round(float(row["budget"]), 2)
+        weight = round((budget / total_budget) * 100, 2) if total_budget > 0 else 0.0
+        normalized_wbs_id: Any = wbs_id
+        if pd.notna(wbs_id):
+            try:
+                numeric_wbs_id = float(wbs_id)
+                normalized_wbs_id = int(numeric_wbs_id) if numeric_wbs_id.is_integer() else numeric_wbs_id
+            except (TypeError, ValueError):
+                normalized_wbs_id = wbs_id
+        weights.append(
+            {
+                "wbs_id": normalized_wbs_id,
+                "label": label_lookup.get(wbs_id, f"WBS {wbs_id}"),
+                "weight": weight,
+                "budget": budget,
+            }
+        )
+
+    return weights
+
+
+def _normalize_activity_ids(series: pd.Series) -> list[Any]:
+    activity_ids: list[Any] = []
+    for value in series.dropna().tolist():
+        try:
+            numeric_value = float(value)
+            activity_ids.append(int(numeric_value) if numeric_value.is_integer() else numeric_value)
+        except (TypeError, ValueError):
+            activity_ids.append(value)
+    return activity_ids
+
+
+def _calculate_pass_percentage(total_activities: int, offending_count: int) -> float:
+    if total_activities <= 0:
+        return 100.0
+    return round(((total_activities - offending_count) / total_activities) * 100, 2)
+
+
+def _task_float_days(tasks: pd.DataFrame) -> pd.Series:
+    float_series = _first_matching_series(
+        tasks,
+        ["total_float_days", "total_float_day_cnt", "total_float_hr_cnt", "total_float"],
+    )
+    if float_series is None:
+        return pd.Series([0.0] * len(tasks.index), index=tasks.index, dtype="float64")
+
+    float_column = _first_matching_column(
+        tasks,
+        ["total_float_days", "total_float_day_cnt", "total_float_hr_cnt", "total_float"],
+    )
+    if float_column and float_column.lower() == "total_float_hr_cnt":
+        return (float_series / 8.0).astype("float64")
+    return float_series.astype("float64")
+
+
+def _build_schedule_health(tasks: pd.DataFrame, taskpred: pd.DataFrame, data_date: pd.Timestamp | None) -> dict[str, Any]:
+    total_activities = int(len(tasks.index))
+    if tasks.empty:
+        rules = [
+            {"rule_key": "missing_logic", "label": "Missing Logic", "pass_percentage": 100.0, "offending_activity_ids": [], "offending_count": 0},
+            {"rule_key": "negative_float", "label": "Negative Float", "pass_percentage": 100.0, "offending_activity_ids": [], "offending_count": 0},
+            {"rule_key": "high_float", "label": "High Float (>44 days)", "pass_percentage": 100.0, "offending_activity_ids": [], "offending_count": 0},
+            {"rule_key": "invalid_dates", "label": "Invalid Dates", "pass_percentage": 100.0, "offending_activity_ids": [], "offending_count": 0},
+            {"rule_key": "hard_constraints", "label": "Hard Constraints", "pass_percentage": 100.0, "offending_activity_ids": [], "offending_count": 0},
+        ]
+        return {
+            "data_date": data_date.strftime("%Y-%m-%d") if data_date is not None else None,
+            "summary": {
+                "total_activities": 0,
+                "rule_count": len(rules),
+                "average_pass_percentage": 100.0,
+            },
+            "rules": rules,
+        }
+
+    task_id_column = _first_matching_column(tasks, ["task_id", "task_code", "task_pk"])
+    if task_id_column is None:
+        raise HTTPException(status_code=500, detail="TASK table is missing a task identifier column.")
+
+    task_ids = tasks[task_id_column]
+    predecessor_ids: set[Any] = set()
+    successor_ids: set[Any] = set()
+    if taskpred is not None and not taskpred.empty:
+        pred_column = _first_matching_column(taskpred, ["pred_task_id", "pred_task_code", "pred_task_pk"])
+        succ_column = _first_matching_column(taskpred, ["task_id", "succ_task_id", "task_code"])
+        if pred_column is not None:
+            predecessor_ids = set(taskpred[pred_column].dropna().tolist())
+        if succ_column is not None:
+            successor_ids = set(taskpred[succ_column].dropna().tolist())
+
+    missing_logic_mask = ~task_ids.isin(predecessor_ids) | ~task_ids.isin(successor_ids)
+    missing_logic_ids = _normalize_activity_ids(task_ids[missing_logic_mask])
+
+    float_days = _task_float_days(tasks)
+    negative_float_ids = _normalize_activity_ids(task_ids[float_days < 0])
+    high_float_ids = _normalize_activity_ids(task_ids[float_days > 44])
+
+    invalid_date_mask = pd.Series([False] * len(tasks.index), index=tasks.index)
+    if data_date is not None:
+        for series in [
+            _first_matching_datetime_series(tasks, ["act_start_date", "actual_start_date"]),
+            _first_matching_datetime_series(tasks, ["act_end_date", "actual_end_date", "completion_date"]),
+        ]:
+            if series is not None:
+                invalid_date_mask = invalid_date_mask | (series > data_date)
+    invalid_date_ids = _normalize_activity_ids(task_ids[invalid_date_mask])
+
+    constraint_column = _first_matching_column(tasks, ["constraint_type", "cstr_type", "primary_constraint_type"])
+    hard_constraint_ids: list[Any] = []
+    if constraint_column is not None:
+        allowed_soft_constraints = {
+            "asap",
+            "alap",
+            "none",
+            "start on or after",
+            "finish on or before",
+            "snet",
+            "fnlt",
+            "fnet",
+            "snlt",
+        }
+        normalized_constraints = tasks[constraint_column].fillna("").astype(str).str.strip().str.lower()
+        hard_constraint_mask = normalized_constraints.ne("") & ~normalized_constraints.isin(allowed_soft_constraints)
+        hard_constraint_ids = _normalize_activity_ids(task_ids[hard_constraint_mask])
+
+    rules = [
+        {
+            "rule_key": "missing_logic",
+            "label": "Missing Logic",
+            "pass_percentage": _calculate_pass_percentage(total_activities, len(missing_logic_ids)),
+            "offending_activity_ids": missing_logic_ids,
+            "offending_count": len(missing_logic_ids),
+        },
+        {
+            "rule_key": "negative_float",
+            "label": "Negative Float",
+            "pass_percentage": _calculate_pass_percentage(total_activities, len(negative_float_ids)),
+            "offending_activity_ids": negative_float_ids,
+            "offending_count": len(negative_float_ids),
+        },
+        {
+            "rule_key": "high_float",
+            "label": "High Float (>44 days)",
+            "pass_percentage": _calculate_pass_percentage(total_activities, len(high_float_ids)),
+            "offending_activity_ids": high_float_ids,
+            "offending_count": len(high_float_ids),
+        },
+        {
+            "rule_key": "invalid_dates",
+            "label": "Invalid Dates",
+            "pass_percentage": _calculate_pass_percentage(total_activities, len(invalid_date_ids)),
+            "offending_activity_ids": invalid_date_ids,
+            "offending_count": len(invalid_date_ids),
+        },
+        {
+            "rule_key": "hard_constraints",
+            "label": "Hard Constraints",
+            "pass_percentage": _calculate_pass_percentage(total_activities, len(hard_constraint_ids)),
+            "offending_activity_ids": hard_constraint_ids,
+            "offending_count": len(hard_constraint_ids),
+        },
+    ]
+
+    average_pass_percentage = round(sum(rule["pass_percentage"] for rule in rules) / len(rules), 2)
+    return {
+        "data_date": data_date.strftime("%Y-%m-%d") if data_date is not None else None,
+        "summary": {
+            "total_activities": total_activities,
+            "rule_count": len(rules),
+            "average_pass_percentage": average_pass_percentage,
+        },
+        "rules": rules,
+    }
+
+
+def _get_selected_project_dataset() -> tuple[str, dict[str, Any]]:
+    project_data = app.state.project_data
+    if project_data is None:
+        raise HTTPException(status_code=400, detail="No project data uploaded yet.")
+
+    source_key = "updated" if project_data.get("updated") is not None else "original"
+    selected = project_data[source_key]
+    source_label = "updated_xer" if source_key == "updated" else "original_xer"
+    return source_label, selected
+
+
+def _build_remaining_cost_dataframe(tasks: pd.DataFrame, wbs: pd.DataFrame) -> pd.DataFrame:
+    if tasks is None or tasks.empty:
+        return pd.DataFrame(
+            columns=[
+                "task_id",
+                "task_name",
+                "wbs_id",
+                "wbs_name",
+                "budget",
+                "planned_value",
+                "earned_value",
+                "variance_to_plan",
+                "remaining_cost",
+            ]
+        )
+
+    task_id_column = _first_matching_column(tasks, ["task_id", "task_code", "task_pk"])
+    task_name_column = _first_matching_column(tasks, ["task_name", "task_short_name", "name"])
+    wbs_column = _first_matching_column(tasks, ["wbs_id", "projwbs_id", "parent_wbs_id"])
+
+    budget_series = _first_matching_series(
+        tasks,
+        ["target_cost", "at_completion_total_cost", "budget_at_completion", "total_cost"],
+    )
+    if budget_series is None:
+        budget_series = pd.Series([0.0] * len(tasks.index), index=tasks.index, dtype="float64")
+
+    planned_value_series = _first_matching_series(tasks, ["planned_value", "bcws"])
+    if planned_value_series is None:
+        planned_value_series = pd.Series([0.0] * len(tasks.index), index=tasks.index, dtype="float64")
+
+    earned_value_series = _first_matching_series(tasks, ["earned_value", "bcwp"])
+    if earned_value_series is None:
+        progress_series = _first_matching_series(
+            tasks,
+            ["phys_complete_pct", "task_complete_pct", "complete_pct", "percent_complete"],
+        )
+        if progress_series is not None:
+            earned_value_series = budget_series * (progress_series / 100.0)
+        else:
+            earned_value_series = pd.Series([0.0] * len(tasks.index), index=tasks.index, dtype="float64")
+
+    task_names = tasks[task_name_column].astype(str) if task_name_column is not None else pd.Series([""] * len(tasks.index), index=tasks.index)
+    task_ids = tasks[task_id_column] if task_id_column is not None else pd.Series(range(1, len(tasks.index) + 1), index=tasks.index)
+    wbs_ids = tasks[wbs_column] if wbs_column is not None else pd.Series([pd.NA] * len(tasks.index), index=tasks.index)
+
+    label_lookup: dict[Any, str] = {}
+    if wbs is not None and not wbs.empty:
+        id_column = _first_matching_column(wbs, ["wbs_id", "projwbs_id"])
+        label_column = _first_matching_column(wbs, ["wbs_name", "wbs_short_name", "wbs_code"])
+        if id_column is not None and label_column is not None:
+            label_lookup = {
+                row[id_column]: str(row[label_column])
+                for _, row in wbs[[id_column, label_column]].dropna(subset=[id_column]).iterrows()
+            }
+
+    frame = pd.DataFrame(
+        {
+            "task_id": task_ids,
+            "task_name": task_names,
+            "wbs_id": wbs_ids,
+            "wbs_name": [label_lookup.get(wbs_id, f"WBS {wbs_id}") if pd.notna(wbs_id) else "Unassigned" for wbs_id in wbs_ids],
+            "budget": budget_series.astype("float64"),
+            "planned_value": planned_value_series.astype("float64"),
+            "earned_value": earned_value_series.astype("float64"),
+        }
+    )
+    frame["variance_to_plan"] = (frame["earned_value"] - frame["planned_value"]).round(2)
+    frame["remaining_cost"] = (frame["budget"] - frame["earned_value"]).round(2)
+    frame = frame[[
+        "task_id",
+        "task_name",
+        "wbs_id",
+        "wbs_name",
+        "budget",
+        "planned_value",
+        "earned_value",
+        "variance_to_plan",
+        "remaining_cost",
+    ]]
+    return frame
+
+
+def _build_wbs_remaining_summary(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df.empty:
+        return pd.DataFrame(columns=["wbs_id", "wbs_name", "budget", "planned_value", "earned_value", "remaining_cost"])
+
+    summary = (
+        raw_df.groupby(["wbs_id", "wbs_name"], dropna=False, as_index=False)[["budget", "planned_value", "earned_value", "remaining_cost"]]
+        .sum()
+        .sort_values("budget", ascending=False)
+        .reset_index(drop=True)
+    )
+    return summary
+
+
+def generate_remaining_cost_export(tasks: pd.DataFrame, wbs: pd.DataFrame, source_label: str = "api") -> bytes:
+    raw_df = _build_remaining_cost_dataframe(tasks, wbs)
+    wbs_df = _build_wbs_remaining_summary(raw_df)
+
+    output = BytesIO()
+    workbook = xlsxwriter.Workbook(output, {"in_memory": True})
+
+    title_format = workbook.add_format({"bold": True, "font_size": 16})
+    subtitle_format = workbook.add_format({"italic": True, "font_color": "#475569"})
+    header_format = workbook.add_format({"bold": True, "bg_color": "#DCE6F1", "border": 1})
+    label_format = workbook.add_format({"bold": True, "bg_color": "#F8FAFC", "border": 1})
+    currency_format = workbook.add_format({"num_format": "$#,##0.00", "border": 1})
+    text_format = workbook.add_format({"border": 1})
+    integer_format = workbook.add_format({"num_format": "0", "border": 1})
+
+    raw_sheet = workbook.add_worksheet("Raw Data")
+    raw_sheet.freeze_panes(3, 0)
+    raw_sheet.set_column("A:A", 10)
+    raw_sheet.set_column("B:B", 22)
+    raw_sheet.set_column("C:C", 10)
+    raw_sheet.set_column("D:D", 18)
+    raw_sheet.set_column("E:I", 16)
+
+    raw_sheet.write("A1", "Remaining Cost Export", title_format)
+    raw_sheet.write("A2", f"Source: {source_label}", subtitle_format)
+    raw_sheet.write("D2", "Visible Budget", label_format)
+    raw_sheet.write_formula("E2", "=SUBTOTAL(9,E4:E5)", currency_format)
+    raw_sheet.write("F2", "Visible Earned", label_format)
+    raw_sheet.write_formula("G2", "=SUBTOTAL(9,G4:G5)", currency_format)
+    raw_sheet.write("H2", "Visible Remaining", label_format)
+    raw_sheet.write_formula("I2", "=SUBTOTAL(9,I4:I5)", currency_format)
+
+    raw_headers = [
+        "Task ID",
+        "Task Name",
+        "WBS ID",
+        "WBS Name",
+        "Budget",
+        "Planned Value",
+        "Earned Value",
+        "Variance to Plan",
+        "Remaining Cost",
+    ]
+    for column_index, header in enumerate(raw_headers):
+        raw_sheet.write(2, column_index, header, header_format)
+
+    for row_offset, row in enumerate(raw_df.itertuples(index=False), start=3):
+        raw_sheet.write_number(row_offset, 0, float(row.task_id), integer_format)
+        raw_sheet.write_string(row_offset, 1, str(row.task_name), text_format)
+        raw_sheet.write_number(row_offset, 2, float(row.wbs_id), integer_format)
+        raw_sheet.write_string(row_offset, 3, str(row.wbs_name), text_format)
+        raw_sheet.write_number(row_offset, 4, float(row.budget), currency_format)
+        raw_sheet.write_number(row_offset, 5, float(row.planned_value), currency_format)
+        raw_sheet.write_number(row_offset, 6, float(row.earned_value), currency_format)
+        raw_sheet.write_number(row_offset, 7, float(row.variance_to_plan), currency_format)
+        raw_sheet.write_number(row_offset, 8, float(row.remaining_cost), currency_format)
+
+    raw_last_row = max(len(raw_df) + 3, 4)
+    raw_sheet.autofilter(f"A3:I{raw_last_row}")
+    raw_sheet.conditional_format(
+        f"H4:H{raw_last_row}",
+        {"type": "cell", "criteria": ">=", "value": 0, "format": workbook.add_format({"bg_color": "#C6EFCE", "font_color": "#006100"})},
+    )
+    raw_sheet.conditional_format(
+        f"H4:H{raw_last_row}",
+        {"type": "cell", "criteria": "<", "value": 0, "format": workbook.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006"})},
+    )
+    raw_sheet.write(f"H{raw_last_row + 1}", "Filtered Total Remaining", label_format)
+    raw_sheet.write_formula(f"I{raw_last_row + 1}", f"=SUBTOTAL(9,I4:I{raw_last_row})", currency_format)
+
+    by_wbs_sheet = workbook.add_worksheet("By WBS")
+    by_wbs_sheet.freeze_panes(3, 0)
+    by_wbs_sheet.set_column("A:B", 18)
+    by_wbs_sheet.set_column("C:F", 16)
+    by_wbs_sheet.write("A1", "Remaining Cost by WBS", title_format)
+    by_wbs_sheet.write("A2", f"Source: {source_label}", subtitle_format)
+    by_wbs_sheet.write_formula("C2", "=SUBTOTAL(9,C4:C5)", currency_format)
+    by_wbs_sheet.write_formula("D2", "=SUBTOTAL(9,D4:D5)", currency_format)
+    by_wbs_sheet.write_formula("E2", "=SUBTOTAL(9,E4:E5)", currency_format)
+    by_wbs_sheet.write_formula("F2", "=SUBTOTAL(9,F4:F5)", currency_format)
+
+    by_wbs_headers = ["WBS ID", "WBS Name", "Budget", "Planned Value", "Earned Value", "Remaining Cost"]
+    for column_index, header in enumerate(by_wbs_headers):
+        by_wbs_sheet.write(2, column_index, header, header_format)
+
+    for row_offset, row in enumerate(wbs_df.itertuples(index=False), start=3):
+        by_wbs_sheet.write_number(row_offset, 0, float(row.wbs_id), integer_format)
+        by_wbs_sheet.write_string(row_offset, 1, str(row.wbs_name), text_format)
+        by_wbs_sheet.write_number(row_offset, 2, float(row.budget), currency_format)
+        by_wbs_sheet.write_number(row_offset, 3, float(row.planned_value), currency_format)
+        by_wbs_sheet.write_number(row_offset, 4, float(row.earned_value), currency_format)
+        by_wbs_sheet.write_number(row_offset, 5, float(row.remaining_cost), currency_format)
+
+    by_wbs_last_row = max(len(wbs_df) + 3, 4)
+    by_wbs_sheet.autofilter(f"A3:F{by_wbs_last_row}")
+    by_wbs_sheet.conditional_format(
+        f"F4:F{by_wbs_last_row}",
+        {"type": "3_color_scale"},
+    )
+
+    workbook.close()
+    output.seek(0)
+    return output.getvalue()
+
+
+@app.post("/upload")
+async def upload_xer_files(
+    original_xer: UploadFile = File(...),
+    updated_xer: UploadFile | None = File(default=None),
+) -> dict[str, Any]:
+    original_tables = _parse_uploaded_xer(original_xer)
+    updated_tables = _parse_uploaded_xer(updated_xer) if updated_xer is not None else None
+
+    app.state.project_data = {
+        "original": {
+            "filename": original_xer.filename,
+            "tables": original_tables,
+        },
+        "updated": {
+            "filename": updated_xer.filename,
+            "tables": updated_tables,
+        }
+        if updated_tables is not None
+        else None,
+    }
+
+    response: dict[str, Any] = {
+        "message": "XER file(s) uploaded and parsed successfully.",
+        "original": _table_snapshot(original_tables),
+        "updated": _table_snapshot(updated_tables) if updated_tables is not None else None,
+    }
+    return response
+
+
+@app.get("/api/evm-kpis")
+async def get_evm_kpis(date_window: str = Query("all"), activity_code: str = Query("all")) -> dict[str, Any]:
+    _, selected = _get_selected_project_dataset()
+    tasks = selected["tables"].get("TASK", pd.DataFrame())
+    taskactv = selected["tables"].get("TASKACTV", pd.DataFrame())
+    data_date = _resolve_data_date(tasks, taskactv)
+    filtered_tasks, _ = _filter_dashboard_frames(tasks, taskactv, data_date, date_window=date_window, activity_code=activity_code)
+
+    kpis = _calculate_evm_kpis(filtered_tasks)
+    return {
+        **kpis,
+        "source": "updated_xer" if app.state.project_data.get("updated") is not None else "original_xer",
+    }
+
+
+@app.get("/api/s-curve")
+async def get_s_curve(date_window: str = Query("all"), activity_code: str = Query("all")) -> dict[str, Any]:
+    source_label, selected = _get_selected_project_dataset()
+    tables = selected["tables"]
+    tasks = tables.get("TASK", pd.DataFrame())
+    taskactv = tables.get("TASKACTV", pd.DataFrame())
+    actvcode = tables.get("ACTVCODE", pd.DataFrame())
+    wbs = tables.get("PROJWBS", pd.DataFrame())
+    data_date = _resolve_data_date(tasks, taskactv)
+    filtered_tasks, filtered_taskactv = _filter_dashboard_frames(tasks, taskactv, data_date, date_window=date_window, activity_code=activity_code)
+
+    curve = _build_event_curve(filtered_tasks, filtered_taskactv)
+    return {
+        "source": source_label,
+        **curve,
+        "activity_codes": _build_activity_code_catalog(taskactv, actvcode),
+        "wbs_weights": _calculate_wbs_weights(filtered_tasks, wbs),
+    }
+
+
+@app.get("/api/export-excel")
+async def export_excel() -> StreamingResponse:
+    source_label, selected = _get_selected_project_dataset()
+    tables = selected["tables"]
+    workbook_bytes = generate_remaining_cost_export(
+        tasks=tables.get("TASK", pd.DataFrame()),
+        wbs=tables.get("PROJWBS", pd.DataFrame()),
+        source_label=source_label,
+    )
+    return StreamingResponse(
+        BytesIO(workbook_bytes),
+        media_type=EXCEL_CONTENT_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="remaining-cost-export.xlsx"'},
+    )
+
+
+@app.get("/api/schedule-health")
+async def get_schedule_health(date_window: str = Query("all"), activity_code: str = Query("all")) -> dict[str, Any]:
+    source_label, selected = _get_selected_project_dataset()
+    tables = selected["tables"]
+    tasks = tables.get("TASK", pd.DataFrame())
+    taskpred = tables.get("TASKPRED", pd.DataFrame())
+    taskactv = tables.get("TASKACTV", pd.DataFrame())
+    data_date = _resolve_data_date(tasks, taskactv)
+    filtered_tasks, filtered_taskactv = _filter_dashboard_frames(tasks, taskactv, data_date, date_window=date_window, activity_code=activity_code)
+    filtered_task_ids = set()
+    task_id_column = _first_matching_column(filtered_tasks, ["task_id", "task_code", "task_pk"])
+    pred_taskpred = taskpred
+    if task_id_column is not None and not filtered_tasks.empty:
+        filtered_task_ids = set(filtered_tasks[task_id_column].dropna().tolist())
+    if not taskpred.empty and filtered_task_ids:
+        pred_task_column = _first_matching_column(taskpred, ["task_id", "task_code", "task_pk"])
+        pred_pred_column = _first_matching_column(taskpred, ["pred_task_id", "pred_task_code", "pred_task_pk"])
+        if pred_task_column is not None and pred_pred_column is not None:
+            pred_taskpred = taskpred[
+                taskpred[pred_task_column].isin(filtered_task_ids) | taskpred[pred_pred_column].isin(filtered_task_ids)
+            ].copy()
+    assessment = _build_schedule_health(filtered_tasks, pred_taskpred, data_date)
+    return {
+        "source": source_label,
+        **assessment,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

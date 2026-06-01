@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PlanSight Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            slate: {
+              950: '#050816'
+            },
+            brand: {
+              400: '#4fd1c5',
+              500: '#22c7b8',
+              600: '#179d92'
+            }
+          },
+          boxShadow: {
+            soft: '0 10px 30px rgba(0,0,0,0.28)'
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    [v-cloak] { display: none; }
+    body {
+      background:
+        radial-gradient(circle at top left, rgba(34, 199, 184, 0.10), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(96, 165, 250, 0.10), transparent 32%),
+        #050816;
+    }
+  </style>
+</head>
+<body class="min-h-screen text-slate-100 antialiased">
+  <div id="app" v-cloak class="min-h-screen">
+    <div class="flex min-h-screen">
+      <aside class="hidden w-72 border-r border-white/10 bg-slate-950/70 backdrop-blur xl:flex xl:flex-col">
+        <div class="border-b border-white/10 px-8 py-8">
+          <div class="flex items-center gap-3">
+            <div class="flex h-11 w-11 items-center justify-center rounded-2xl bg-brand-500/20 text-brand-400 ring-1 ring-brand-400/30">
+              <span class="text-lg font-bold">P</span>
+            </div>
+            <div>
+              <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Local Project Controls</p>
+              <h1 class="text-2xl font-semibold tracking-tight text-white">PlanSight</h1>
+            </div>
+          </div>
+        </div>
+
+        <nav class="flex-1 px-5 py-6">
+          <p class="px-3 pb-3 text-xs font-semibold uppercase tracking-[0.3em] text-slate-500">Menu</p>
+          <ul class="space-y-2">
+            <li v-for="item in menu" :key="item.name">
+              <a
+                href="#"
+                class="flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-medium transition"
+                :class="item.active ? 'bg-white/10 text-white shadow-soft ring-1 ring-white/10' : 'text-slate-400 hover:bg-white/5 hover:text-white'"
+              >
+                <span class="text-base">{{ item.icon }}</span>
+                <span>{{ item.name }}</span>
+              </a>
+            </li>
+          </ul>
+        </nav>
+
+        <div class="m-5 rounded-3xl border border-white/10 bg-white/5 p-5">
+          <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Workspace</p>
+          <h2 class="mt-3 text-lg font-semibold text-white">Primavera P6 Health View</h2>
+          <p class="mt-2 text-sm leading-6 text-slate-400">
+            Local-only analysis shell for schedule KPIs, WBS health, resource pressure, and trend visibility.
+          </p>
+        </div>
+      </aside>
+
+      <main class="flex-1">
+        <header class="border-b border-white/10 bg-slate-950/40 backdrop-blur">
+          <div class="mx-auto flex max-w-7xl flex-col gap-4 px-5 py-5 sm:px-8 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <p class="text-xs uppercase tracking-[0.3em] text-brand-400">Sprint 6 schedule assessment</p>
+              <h2 class="mt-2 text-3xl font-semibold tracking-tight text-white">Dashboard Overview</h2>
+              <p class="mt-2 text-sm text-slate-400">
+                Connected to <code class="rounded bg-white/10 px-2 py-1 text-xs text-slate-200">/api/evm-kpis</code>
+                and <code class="rounded bg-white/10 px-2 py-1 text-xs text-slate-200">/api/s-curve</code>
+                and <code class="rounded bg-white/10 px-2 py-1 text-xs text-slate-200">/api/schedule-health</code>
+                with Vue 3 + Chart.js via CDN.
+              </p>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-3 text-sm">
+              <span class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-slate-300">
+                API status:
+                <strong :style="statusTone">{{ statusText }}</strong>
+              </span>
+              <span class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-slate-300">
+                Data source:
+                <strong class="text-white">{{ kpis.source || 'none' }}</strong>
+              </span>
+              <span class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-slate-300">
+                Data Date:
+                <strong class="text-white">{{ sCurve.data_date || 'n/a' }}</strong>
+              </span>
+            </div>
+          </div>
+        </header>
+
+        <div class="mx-auto max-w-7xl px-5 py-6 sm:px-8 sm:py-8">
+          <div v-if="error" class="mb-6 rounded-2xl border border-amber-400/20 bg-amber-500/10 px-5 py-4 text-sm text-amber-100">
+            <strong class="font-semibold">Fetch note:</strong>
+            {{ error }}
+          </div>
+
+          <section class="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+            <article
+              v-for="card in metricCards"
+              :key="card.label"
+              class="rounded-3xl border border-white/10 bg-white/5 p-5 shadow-soft backdrop-blur"
+            >
+              <div class="flex items-start justify-between gap-3">
+                <div>
+                  <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">{{ card.label }}</p>
+                  <p class="mt-3 text-3xl font-semibold tracking-tight text-white">{{ card.value }}</p>
+                </div>
+                <span class="rounded-2xl border border-white/10 bg-slate-900/60 px-3 py-2 text-xs text-slate-300">
+                  {{ card.badge }}
+                </span>
+              </div>
+              <p class="mt-4 text-sm leading-6 text-slate-400">{{ card.help }}</p>
+            </article>
+          </section>
+
+          <section class="mt-8 grid gap-6 xl:grid-cols-[1.5fr_1fr]">
+            <article class="rounded-3xl border border-white/10 bg-white/5 p-6 shadow-soft backdrop-blur">
+              <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                  <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">S-Curve</p>
+                  <h3 class="mt-2 text-xl font-semibold text-white">Cumulative Planned vs Earned Value</h3>
+                  <p class="mt-2 text-sm text-slate-400">Client-side slicer filters the API arrays without another roundtrip.</p>
+                </div>
+
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    v-for="option in slicerOptions"
+                    :key="option.value"
+                    type="button"
+                    class="rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.2em] transition"
+                    :class="selectedWindow === option.value ? 'border-brand-400/40 bg-brand-500/15 text-brand-200' : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10'"
+                    @click="setDateWindow(option.value)"
+                  >
+                    {{ option.label }}
+                  </button>
+                  <select
+                    v-model="selectedActivityCode"
+                    @change="loadDashboard"
+                    class="rounded-full border border-white/10 bg-slate-950/80 px-4 py-2 text-xs font-semibold uppercase tracking-[0.2em] text-slate-200 outline-none transition hover:bg-white/10"
+                  >
+                    <option v-for="option in activityCodeOptions" :key="option.value" :value="option.value">
+                      {{ option.label }}{{ option.value !== 'all' ? ` (${option.count})` : '' }}
+                    </option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="mt-6 rounded-[28px] border border-white/10 bg-slate-950/60 p-5">
+                <div class="h-80 rounded-[22px] bg-slate-950/80 p-2">
+                  <canvas id="sCurveChart"></canvas>
+                </div>
+              </div>
+            </article>
+
+            <div class="grid gap-6">
+              <article class="rounded-3xl border border-white/10 bg-white/5 p-6 shadow-soft backdrop-blur">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">WBS breakdown</p>
+                    <h3 class="mt-2 text-xl font-semibold text-white">Budget weight by WBS</h3>
+                  </div>
+                  <span class="text-xs text-slate-500">Top weighted packages</span>
+                </div>
+
+                <div class="mt-6 grid grid-cols-3 gap-4">
+                  <div v-for="donut in displayedDonuts" :key="donut.label" class="text-center">
+                    <div class="mx-auto flex h-24 w-24 items-center justify-center rounded-full border-[10px] bg-slate-950/70 text-sm font-semibold text-white"
+                      :style="donutRingStyle(donut.weight)">
+                      {{ percent(donut.weight) }}
+                    </div>
+                    <p class="mt-3 text-sm text-slate-300">{{ donut.label }}</p>
+                    <p class="mt-1 text-xs text-slate-500">{{ currency(donut.budget) }}</p>
+                  </div>
+                </div>
+              </article>
+
+              <article class="rounded-3xl border border-white/10 bg-white/5 p-6 shadow-soft backdrop-blur">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">WBS weights list</p>
+                    <h3 class="mt-2 text-xl font-semibold text-white">Full budget distribution</h3>
+                  </div>
+                  <span class="text-xs text-slate-500">Live from /api/s-curve</span>
+                </div>
+
+                <div class="mt-6 space-y-4">
+                  <div v-for="item in sCurve.wbs_weights" :key="`${item.wbs_id}-${item.label}`">
+                    <div class="mb-2 flex items-center justify-between text-sm text-slate-300">
+                      <span>{{ item.label }}</span>
+                      <span>{{ percent(item.weight) }} · {{ currency(item.budget) }}</span>
+                    </div>
+                    <div class="h-3 overflow-hidden rounded-full bg-slate-900">
+                      <div class="h-full rounded-full bg-gradient-to-r from-sky-500 via-brand-500 to-emerald-400" :style="{ width: `${Math.max(item.weight, 4)}%` }"></div>
+                    </div>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="mt-8 rounded-3xl border border-white/10 bg-white/5 p-6 shadow-soft backdrop-blur">
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">DCMA 14-point</p>
+                <h3 class="mt-2 text-xl font-semibold text-white">Schedule Health Assessment</h3>
+                <p class="mt-2 text-sm text-slate-400">Five core rule checks powered by TASK and TASKPRED data.</p>
+              </div>
+              <div class="rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-sm text-slate-300">
+                Overall pass:
+                <strong class="ml-2 text-white">{{ percent(scheduleHealth.summary.average_pass_percentage) }}</strong>
+                <span class="ml-2 text-slate-500">· {{ scheduleHealth.summary.total_activities }} activities</span>
+              </div>
+            </div>
+
+            <div class="mt-6 space-y-4">
+              <article v-for="rule in scheduleHealth.rules" :key="rule.rule_key" class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                  <div>
+                    <div class="flex items-center gap-3">
+                      <h4 class="text-base font-semibold text-white">{{ rule.label }}</h4>
+                      <span class="rounded-full border px-3 py-1 text-xs font-semibold"
+                        :class="rule.offending_count === 0 ? 'border-emerald-400/30 bg-emerald-500/10 text-emerald-300' : 'border-amber-400/30 bg-amber-500/10 text-amber-200'">
+                        {{ rule.offending_count === 0 ? 'PASS' : 'ATTENTION' }}
+                      </span>
+                    </div>
+                    <p class="mt-2 text-sm text-slate-400">Offending activities: {{ formatOffenders(rule.offending_activity_ids) }}</p>
+                  </div>
+                  <div class="min-w-56">
+                    <div class="mb-2 flex items-center justify-between text-sm text-slate-300">
+                      <span>Pass percentage</span>
+                      <span>{{ percent(rule.pass_percentage) }}</span>
+                    </div>
+                    <div class="h-3 overflow-hidden rounded-full bg-slate-900">
+                      <div class="h-full rounded-full" :class="ruleBarTone(rule.pass_percentage)" :style="{ width: `${Math.max(rule.pass_percentage, 4)}%` }"></div>
+                    </div>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    const { createApp } = Vue;
+
+    createApp({
+      data() {
+        return {
+          menu: [
+            { name: 'Dashboard', icon: '◉', active: true },
+            { name: 'Analysis', icon: '△', active: false },
+            { name: 'Profile', icon: '◎', active: false },
+            { name: 'Settings', icon: '⚙', active: false },
+          ],
+          kpis: {
+            bac: 0,
+            pv: 0,
+            ev: 0,
+            spi: null,
+            cpi: null,
+            source: '',
+          },
+          sCurve: {
+            source: '',
+            data_date: '',
+            dates: [],
+            planned_value: [],
+            earned_value: [],
+            wbs_weights: [],
+          },
+          scheduleHealth: {
+            summary: {
+              total_activities: 0,
+              rule_count: 0,
+              average_pass_percentage: 0,
+            },
+            rules: [],
+          },
+          activityCodeOptions: [
+            { label: 'All Activity Codes', value: 'all', count: 0 },
+          ],
+          selectedActivityCode: 'all',
+          slicerOptions: [
+            { label: 'Last 3M', value: '3m' },
+            { label: 'Last 6M', value: '6m' },
+            { label: 'All', value: 'all' },
+          ],
+          selectedWindow: '6m',
+          chart: null,
+          status: 'loading',
+          error: '',
+        };
+      },
+      computed: {
+        metricCards() {
+          return [
+            {
+              label: 'BAC',
+              value: this.currency(this.kpis.bac),
+              badge: 'Budget at Completion',
+              help: 'Mapped from the backend total budget payload.'
+            },
+            {
+              label: 'PV',
+              value: this.currency(this.kpis.pv),
+              badge: 'Planned Value',
+              help: 'Current planned value aggregated from uploaded TASK rows.'
+            },
+            {
+              label: 'EV',
+              value: this.currency(this.kpis.ev),
+              badge: 'Earned Value',
+              help: 'Physical progress converted into earned value when BCWP is absent.'
+            },
+            {
+              label: 'SPI',
+              value: this.ratio(this.kpis.spi),
+              badge: 'Schedule Performance',
+              help: 'Derived in the frontend as EV / PV when planned value is available.'
+            },
+            {
+              label: 'CPI',
+              value: this.ratio(this.kpis.cpi),
+              badge: 'Cost Performance',
+              help: 'Placeholder until actual cost (AC) is exposed by a later endpoint.'
+            }
+          ];
+        },
+        statusText() {
+          if (this.status === 'ready') return 'ready';
+          if (this.status === 'error') return 'error';
+          return 'loading';
+        },
+        statusTone() {
+          if (this.status === 'ready') return { color: '#4fd1c5' };
+          if (this.status === 'error') return { color: '#f59e0b' };
+          return { color: '#cbd5e1' };
+        },
+        filteredCurve() {
+          return {
+            dates: this.sCurve.dates || [],
+            planned_value: this.sCurve.planned_value || [],
+            earned_value: this.sCurve.earned_value || [],
+          };
+        },
+        displayedDonuts() {
+          const items = this.sCurve.wbs_weights && this.sCurve.wbs_weights.length
+            ? this.sCurve.wbs_weights
+            : [
+                { label: 'No data', weight: 0, budget: 0 },
+                { label: 'No data', weight: 0, budget: 0 },
+                { label: 'No data', weight: 0, budget: 0 },
+              ];
+          return items.slice(0, 3);
+        }
+      },
+      methods: {
+        currency(value) {
+          if (value == null || Number.isNaN(value)) return '—';
+          return new Intl.NumberFormat('en-US', {
+            style: 'currency',
+            currency: 'USD',
+            maximumFractionDigits: 0,
+          }).format(value);
+        },
+        ratio(value) {
+          if (value == null || Number.isNaN(value)) return '—';
+          return Number(value).toFixed(2);
+        },
+        percent(value) {
+          if (value == null || Number.isNaN(value)) return '0%';
+          return `${Number(value).toFixed(0)}%`;
+        },
+        formatOffenders(ids) {
+          if (!ids || !ids.length) return 'none';
+          return ids.join(', ');
+        },
+        ruleBarTone(value) {
+          if (value >= 80) return 'bg-gradient-to-r from-emerald-500 to-green-400';
+          if (value >= 50) return 'bg-gradient-to-r from-amber-500 to-yellow-400';
+          return 'bg-gradient-to-r from-rose-500 to-red-400';
+        },
+        donutRingStyle(weight) {
+          const pct = Math.max(0, Math.min(Number(weight || 0), 100));
+          return {
+            borderColor: 'rgba(34, 199, 184, 0.18)',
+            borderTopColor: '#4fd1c5',
+            borderRightColor: pct > 25 ? '#4fd1c5' : 'rgba(34, 199, 184, 0.18)',
+            borderBottomColor: pct > 50 ? '#4fd1c5' : 'rgba(34, 199, 184, 0.18)',
+            borderLeftColor: pct > 75 ? '#4fd1c5' : 'rgba(34, 199, 184, 0.18)',
+          };
+        },
+        buildQueryString() {
+          const params = new URLSearchParams();
+          params.set('date_window', this.selectedWindow || 'all');
+          params.set('activity_code', this.selectedActivityCode || 'all');
+          return params.toString();
+        },
+        setDateWindow(value) {
+          this.selectedWindow = value;
+          this.loadDashboard();
+        },
+        setActivityCode(value) {
+          this.selectedActivityCode = value;
+          this.loadDashboard();
+        },
+        buildChart() {
+          const canvas = document.getElementById('sCurveChart');
+          if (!canvas) return;
+
+          if (this.chart) {
+            this.chart.destroy();
+          }
+
+          const ctx = canvas.getContext('2d');
+          this.chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: [],
+              datasets: [
+                {
+                  label: 'PV',
+                  data: [],
+                  borderColor: '#60a5fa',
+                  backgroundColor: 'rgba(96, 165, 250, 0.15)',
+                  tension: 0.3,
+                  borderWidth: 3,
+                  pointRadius: 3,
+                },
+                {
+                  label: 'EV',
+                  data: [],
+                  borderColor: '#22c7b8',
+                  backgroundColor: 'rgba(34, 199, 184, 0.18)',
+                  tension: 0.3,
+                  borderWidth: 3,
+                  pointRadius: 3,
+                },
+              ],
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: {
+                mode: 'index',
+                intersect: false,
+              },
+              plugins: {
+                legend: {
+                  labels: {
+                    color: '#e2e8f0'
+                  }
+                }
+              },
+              scales: {
+                x: {
+                  ticks: { color: '#94a3b8' },
+                  grid: { color: 'rgba(148, 163, 184, 0.10)' }
+                },
+                y: {
+                  ticks: {
+                    color: '#94a3b8',
+                    callback: value => new Intl.NumberFormat('en-US', {
+                      style: 'currency',
+                      currency: 'USD',
+                      maximumFractionDigits: 0,
+                    }).format(value),
+                  },
+                  grid: { color: 'rgba(148, 163, 184, 0.10)' }
+                }
+              }
+            }
+          });
+        },
+        updateChart() {
+          if (!this.chart) {
+            this.buildChart();
+          }
+          if (!this.chart) return;
+
+          this.chart.data.labels = this.filteredCurve.dates;
+          this.chart.data.datasets[0].data = this.filteredCurve.planned_value;
+          this.chart.data.datasets[1].data = this.filteredCurve.earned_value;
+          this.chart.update();
+        },
+        async loadKpis() {
+          const response = await fetch(`http://127.0.0.1:8000/api/evm-kpis?${this.buildQueryString()}`);
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            throw new Error(payload.detail || `API returned ${response.status}`);
+          }
+          const payload = await response.json();
+          const bac = Number(payload.total_budget || 0);
+          const pv = Number(payload.planned_value || 0);
+          const ev = Number(payload.earned_value || 0);
+          const spi = payload.spi != null ? Number(payload.spi) : (pv > 0 ? ev / pv : null);
+
+          this.kpis = {
+            bac,
+            pv,
+            ev,
+            spi,
+            cpi: null,
+            source: payload.source || 'api',
+          };
+        },
+        async loadSCurve() {
+          const response = await fetch(`http://127.0.0.1:8000/api/s-curve?${this.buildQueryString()}`);
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            throw new Error(payload.detail || `API returned ${response.status}`);
+          }
+          const payload = await response.json();
+          this.sCurve = {
+            source: payload.source || 'api',
+            data_date: payload.data_date || '',
+            dates: payload.dates || [],
+            planned_value: (payload.planned_value || []).map(Number),
+            earned_value: (payload.earned_value || []).map(Number),
+            wbs_weights: payload.wbs_weights || [],
+            activity_codes: payload.activity_codes || [],
+          };
+          const options = Array.isArray(payload.activity_codes) && payload.activity_codes.length
+            ? payload.activity_codes
+            : [{ label: 'All Activity Codes', value: 'all', count: 0 }];
+          this.activityCodeOptions = options;
+          if (!options.some(option => option.value === this.selectedActivityCode)) {
+            this.selectedActivityCode = 'all';
+          }
+        },
+        async loadScheduleHealth() {
+          const response = await fetch(`http://127.0.0.1:8000/api/schedule-health?${this.buildQueryString()}`);
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            throw new Error(payload.detail || `API returned ${response.status}`);
+          }
+          const payload = await response.json();
+          this.scheduleHealth = {
+            summary: payload.summary || {
+              total_activities: 0,
+              rule_count: 0,
+              average_pass_percentage: 0,
+            },
+            rules: payload.rules || [],
+          };
+        },
+        async loadDashboard() {
+          this.status = 'loading';
+          this.error = '';
+          try {
+            await Promise.all([this.loadKpis(), this.loadSCurve(), this.loadScheduleHealth()]);
+            this.status = 'ready';
+            this.$nextTick(() => this.updateChart());
+          } catch (err) {
+            this.status = 'error';
+            this.error = err instanceof Error
+              ? err.message
+              : 'Unable to load dashboard data from the local API.';
+          }
+        }
+      },
+      mounted() {
+        this.buildChart();
+        this.loadDashboard();
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>

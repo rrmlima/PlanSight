@@ -268,6 +268,49 @@
             </div>
           </section>
 
+          <section class="mt-8 rounded-3xl border border-white/10 bg-white/5 p-6 shadow-soft backdrop-blur">
+            <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">Sprint 10 forecast</p>
+                <h3 class="mt-2 text-xl font-semibold text-white">Forecast Outlook</h3>
+                <p class="mt-2 text-sm text-slate-400">SPI-based forecast using the live EVM snapshot and the same filters as the dashboard.</p>
+              </div>
+              <div class="rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-sm text-slate-300">
+                Forecast status: <strong class="text-white">{{ forecast.summary.forecast_status }}</strong>
+                · <strong class="text-white">{{ forecast.summary.task_count }}</strong> tasks
+              </div>
+            </div>
+
+            <div class="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <article v-for="card in forecastCards" :key="card.label" class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">{{ card.label }}</p>
+                <p class="mt-3 text-2xl font-semibold text-white">{{ card.value }}</p>
+                <p class="mt-2 text-sm text-slate-400">{{ card.detail }}</p>
+              </article>
+            </div>
+
+            <div class="mt-6 grid gap-4 lg:grid-cols-2">
+              <article class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                <h4 class="text-sm font-semibold uppercase tracking-[0.25em] text-slate-500">Current snapshot</h4>
+                <div class="mt-4 space-y-3 text-sm text-slate-300">
+                  <p>BAC: <strong class="text-white">{{ currency(forecast.current.bac) }}</strong></p>
+                  <p>PV: <strong class="text-white">{{ currency(forecast.current.pv) }}</strong></p>
+                  <p>EV: <strong class="text-white">{{ currency(forecast.current.ev) }}</strong></p>
+                  <p>SPI: <strong class="text-white">{{ ratio(forecast.current.spi) }}</strong></p>
+                </div>
+              </article>
+              <article class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                <h4 class="text-sm font-semibold uppercase tracking-[0.25em] text-slate-500">Forecast notes</h4>
+                <div class="mt-4 space-y-3 text-sm text-slate-300">
+                  <p>Completion %: <strong class="text-white">{{ percent(forecast.forecast.completion_percent) }}</strong></p>
+                  <p>Variance at completion: <strong class="text-white">{{ signedCurrency(forecast.forecast.vac) }}</strong></p>
+                  <p>Estimate to complete: <strong class="text-white">{{ currency(forecast.forecast.etc) }}</strong></p>
+                  <p class="text-slate-400">SPI-based projection; update the filters to re-evaluate the outlook.</p>
+                </div>
+              </article>
+            </div>
+          </section>
+
           <section class="mt-8 grid gap-6 xl:grid-cols-[1.5fr_1fr]">
             <article class="rounded-3xl border border-white/10 bg-white/5 p-6 shadow-soft backdrop-blur">
               <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
@@ -454,6 +497,31 @@
             near_critical_task_names: [],
             near_critical_tasks: [],
           },
+          forecast: {
+            source: '',
+            filters: {
+              date_window: 'all',
+              activity_code: 'all',
+            },
+            current: {
+              bac: 0,
+              pv: 0,
+              ev: 0,
+              spi: null,
+            },
+            forecast: {
+              eac: 0,
+              etc: 0,
+              vac: 0,
+              completion_percent: 0,
+            },
+            summary: {
+              forecast_status: 'at_risk',
+              forecast_completion_percent: 0,
+              forecast_variance: 0,
+              task_count: 0,
+            },
+          },
           baselineComparison: {
             source: '',
             filters: {
@@ -594,6 +662,32 @@
               original: this.ratio(original.spi),
               updated: this.ratio(updated.spi),
               delta: this.signedRatio(delta.spi),
+            },
+          ];
+        },
+        forecastCards() {
+          const current = this.forecast.current || {};
+          const projection = this.forecast.forecast || {};
+          return [
+            {
+              label: 'EAC',
+              value: this.currency(projection.eac),
+              detail: `BAC ${this.currency(current.bac)} · SPI ${this.ratio(current.spi)}`,
+            },
+            {
+              label: 'ETC',
+              value: this.currency(projection.etc),
+              detail: 'Estimate to complete based on SPI-driven forecast.',
+            },
+            {
+              label: 'VAC',
+              value: this.signedCurrency(projection.vac),
+              detail: 'Variance at completion vs BAC.',
+            },
+            {
+              label: 'Completion',
+              value: this.percent(projection.completion_percent),
+              detail: 'Earned value divided by forecast completion cost.',
             },
           ];
         }
@@ -827,6 +921,26 @@
             near_critical_tasks: payload.near_critical_tasks || [],
           };
         },
+        async loadForecast() {
+          const response = await fetch(`http://127.0.0.1:8000/api/forecast?${this.buildQueryString()}`);
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            throw new Error(payload.detail || `API returned ${response.status}`);
+          }
+          const payload = await response.json();
+          this.forecast = {
+            source: payload.source || '',
+            filters: payload.filters || { date_window: 'all', activity_code: 'all' },
+            current: payload.current || { bac: 0, pv: 0, ev: 0, spi: null },
+            forecast: payload.forecast || { eac: 0, etc: 0, vac: 0, completion_percent: 0 },
+            summary: payload.summary || {
+              forecast_status: 'at_risk',
+              forecast_completion_percent: 0,
+              forecast_variance: 0,
+              task_count: 0,
+            },
+          };
+        },
         async loadBaselineCompare() {
           const response = await fetch(`http://127.0.0.1:8000/api/baseline-compare?${this.buildQueryString()}`);
           if (!response.ok) {
@@ -861,7 +975,7 @@
           this.status = 'loading';
           this.error = '';
           try {
-            await Promise.all([this.loadKpis(), this.loadSCurve(), this.loadScheduleHealth(), this.loadCriticalPath(), this.loadBaselineCompare()]);
+            await Promise.all([this.loadKpis(), this.loadSCurve(), this.loadScheduleHealth(), this.loadCriticalPath(), this.loadForecast(), this.loadBaselineCompare()]);
             this.status = 'ready';
             this.$nextTick(() => this.updateChart());
           } catch (err) {

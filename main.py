@@ -919,6 +919,76 @@ def _build_critical_path_summary(
     }
 
 
+def _build_forecast_summary(
+    tasks: pd.DataFrame,
+    taskactv: pd.DataFrame,
+    data_date: pd.Timestamp | None,
+    *,
+    date_window: str = "all",
+    activity_code: str = "all",
+    source_label: str,
+) -> dict[str, Any]:
+    filtered_tasks, _ = _filter_dashboard_frames(
+        tasks,
+        taskactv if taskactv is not None else pd.DataFrame(),
+        data_date,
+        date_window=date_window,
+        activity_code=activity_code,
+    )
+
+    kpis = _calculate_evm_kpis(filtered_tasks)
+    bac = round(float(kpis.get("total_budget") or 0.0), 2)
+    pv = round(float(kpis.get("planned_value") or 0.0), 2)
+    ev = round(float(kpis.get("earned_value") or 0.0), 2)
+    spi_value = kpis.get("spi")
+    spi = round(float(spi_value), 4) if spi_value is not None else None
+    exact_spi = (ev / pv) if pv else None
+
+    if exact_spi is not None and exact_spi > 0:
+        eac = round(bac / exact_spi, 2)
+    else:
+        eac = bac
+    etc = round(eac - ev, 2)
+    vac = round(bac - eac, 2)
+    completion_percent = round((ev / eac) * 100.0, 2) if eac else 0.0
+    forecast_status = "at_risk"
+    if spi is not None:
+        if spi >= 1.0:
+            forecast_status = "on_track"
+        elif spi >= 0.9:
+            forecast_status = "watch"
+        elif spi >= 0.75:
+            forecast_status = "at_risk"
+        else:
+            forecast_status = "critical"
+
+    return {
+        "source": source_label,
+        "filters": {
+            "date_window": date_window,
+            "activity_code": activity_code,
+        },
+        "current": {
+            "bac": bac,
+            "pv": pv,
+            "ev": ev,
+            "spi": spi,
+        },
+        "forecast": {
+            "eac": eac,
+            "etc": etc,
+            "vac": vac,
+            "completion_percent": completion_percent,
+        },
+        "summary": {
+            "forecast_status": forecast_status,
+            "forecast_completion_percent": completion_percent,
+            "forecast_variance": vac,
+            "task_count": int(len(filtered_tasks.index)),
+        },
+    }
+
+
 def _build_remaining_cost_dataframe(tasks: pd.DataFrame, wbs: pd.DataFrame) -> pd.DataFrame:
     if tasks is None or tasks.empty:
         return pd.DataFrame(
@@ -1264,6 +1334,24 @@ async def get_critical_path(date_window: str = Query("all"), activity_code: str 
         },
         **critical_path,
     }
+
+
+@app.get("/api/forecast")
+async def get_forecast(date_window: str = Query("all"), activity_code: str = Query("all")) -> dict[str, Any]:
+    source_label, selected = _get_selected_project_dataset()
+    tables = selected["tables"]
+    tasks = tables.get("TASK", pd.DataFrame())
+    taskactv = tables.get("TASKACTV", pd.DataFrame())
+    data_date = _resolve_data_date(tasks, taskactv)
+    forecast = _build_forecast_summary(
+        tasks,
+        taskactv,
+        data_date,
+        date_window=date_window,
+        activity_code=activity_code,
+        source_label=source_label,
+    )
+    return forecast
 
 
 @app.get("/api/baseline-compare")
